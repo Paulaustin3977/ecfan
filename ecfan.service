@@ -1,0 +1,15 @@
+[Unit]
+Description=ChromeOS EC fan control (quiet temperature-aware curve)
+Documentation=man:fancontrol(8)
+After=multi-user.target
+# The EC chardev must exist before we talk to it.
+ConditionPathExists=/dev/cros_ec
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ecfan --config /etc/ecfan.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

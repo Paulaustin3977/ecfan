@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""ecfan - quiet, temperature-aware fan control for Chromebooks.
+
+Chromebooks drive the fan from the ChromeOS EC, not from a Linux PWM chip.
+On a plain Linux kernel the EC's own "automatic" curve gets no host thermal
+feed (only ChromeOS' powerd sends one), so it idles the fan at its fallback
+speed - typically ~5000 RPM - regardless of load.
+
+This tool talks to the EC over /dev/cros_ec and sets the fan PWM duty
+directly from the CPU temperature, using a configurable curve.
+
+See README.md for the full rationale and measured numbers.
+"""
+import fcntl
+import glob
+import os
+import signal
+import struct
+import sys
+import time
+
+DEV = "/dev/cros_ec"
+CROS_EC_DEV_IOC = 0xEC
+_HDR = struct.Struct("<5I")          # version, command, outsize, insize, result
+IOCXCMD = (3 << 30) | (_HDR.size << 16) | (CROS_EC_DEV_IOC << 8) | 0
+
+EC_CMD_PWM_SET_FAN_DUTY = 0x0024
+EC_CMD_PWM_GET_FAN_TARGET_RPM = 0x0020
+EC_CMD_THERMAL_AUTO_FAN_CTRL = 0x0052
+EC_RES_SUCCESS = 0
+
+DEFAULT_CONFIG = "/etc/ecfan.conf"
+
+# Only change the duty when it moves by at least this many percent, so a
+# temperature reading that wobbles by a degree does not make the fan audibly
+# hunt between two speeds.
+DUTY_DEADBAND = 3
+
+
+def log(msg):
+    print(f"[ecfan] {msg}", flush=True)
+
+
+# --------------------------------------------------------------------------
+# Sensor discovery
+#
+# hwmon indices differ from board to board, so everything is located by
+# name/label at startup rather than hardcoded.
+# --------------------------------------------------------------------------
+
+def _hwmon_by_name(name, root="/sys/class"):
+    """Return the path of the hwmon device whose `name` file matches."""
+    for path in sorted(glob.glob(os.path.join(root, "hwmon", "hwmon*"))):
+        try:
+            with open(os.path.join(path, "name")) as f:
+                if f.read().strip() == name:
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+def _thermal_zone_by_type(*types, root="/sys/class"):
+    """Return the path of the first thermal zone whose type matches."""
+    for path in sorted(glob.glob(os.path.join(root, "thermal", "thermal_zone*"))):
+        try:
+            with open(os.path.join(path, "type")) as f:
+                if f.read().strip() in types:
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+def _hwmon_temp_by_label(hwmon, label):
+    """Return the input file of the hwmon temp sensor carrying `label`."""
+    if not hwmon:
+        return None
+    for lp in sorted(glob.glob(os.path.join(hwmon, "temp*_label"))):
+        try:
+            with open(lp) as f:
+                if f.read().strip() == label:
+                    return lp[: -len("_label")] + "_input"
+        except OSError:
+            continue
+    return None
+
+
+def discover_sensors(root="/sys/class"):
+    """Locate the fan RPM source and the CPU temperature sources.
+
+    Returns (fan_rpm_path, cpu_temp_paths, ec_temp_paths).
+    """
+    ec = _hwmon_by_name("cros_ec", root)
+
+    fan_path = None
+    if ec:
+        cand = os.path.join(ec, "fan1_input")
+        if os.path.exists(cand):
+            fan_path = cand
+    if fan_path is None:
+        # acpi_fan mirrors the same EC fan on some boards.
+        for path in sorted(glob.glob(os.path.join(root, "hwmon", "hwmon*", "fan1_input"))):
+            fan_path = path
+            break
+
+    cpu_paths = []
+    # x86_pkg_temp is the most accurate package sensor when present.
+    zone = _thermal_zone_by_type("x86_pkg_temp", "TCPU", "TCPU_PCI", root=root)
+    if zone:
+        cpu_paths.append(os.path.join(zone, "temp"))
+    # coretemp "Package id 0" is the same value via a different driver.
+    pkg = _hwmon_temp_by_label(_hwmon_by_name("coretemp", root), "Package id 0")
+    if pkg:
+        cpu_paths.append(pkg)
+
+    ec_paths = []
+    for label in ("CPU choke", "CPU CHOKE", "DDR and SOC", "CPU"):
+        p = _hwmon_temp_by_label(ec, label)
+        if p and p not in ec_paths:
+            ec_paths.append(p)
+
+    return fan_path, cpu_paths, ec_paths
+
+
+# --------------------------------------------------------------------------
+# EC access
+# --------------------------------------------------------------------------
+
+def ec_cmd(command, version=0, outdata=b"", insize=64):
+    """Send one EC host command; returns (result_status, response_bytes)."""
+    fd = os.open(DEV, os.O_RDWR)
+    try:
+        buf = bytearray(_HDR.size + max(len(outdata), insize))
+        struct.pack_into("<5I", buf, 0, version, command, len(outdata), insize, 0)
+        buf[_HDR.size:_HDR.size + len(outdata)] = outdata
+        fcntl.ioctl(fd, IOCXCMD, buf, True)
+        _, _, _, insz, result = struct.unpack_from("<5I", buf, 0)
+        return result, bytes(buf[_HDR.size:_HDR.size + insz])
+    finally:
+        os.close(fd)
+
+
+def set_duty(percent):
+    """Set EC fan PWM duty in percent; also switches the fan to manual mode."""
+    percent = max(0, min(100, int(percent)))
+    r, _ = ec_cmd(EC_CMD_PWM_SET_FAN_DUTY, 0, outdata=struct.pack("<I", percent))
+    return r
+
+
+def set_auto():
+    """Hand fan control back to the EC's own automatic control."""
+    r, _ = ec_cmd(EC_CMD_THERMAL_AUTO_FAN_CTRL, 0)
+    return r
+
+
+def get_target_rpm():
+    """EC's current target RPM, or None if the EC cannot be read."""
+    try:
+        r, d = ec_cmd(EC_CMD_PWM_GET_FAN_TARGET_RPM, 0, insize=8)
+    except OSError:
+        return None
+    if r != EC_RES_SUCCESS:
+        return None
+    return struct.unpack_from("<I", d, 0)[0]
+
+
+# --------------------------------------------------------------------------
+# Readings
+# --------------------------------------------------------------------------
+
+def read_temp(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip()) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+
+class Readings:
+    def __init__(self, root="/sys/class"):
+        self.fan_path, self.cpu_paths, self.ec_paths = discover_sensors(root)
+
+    def cpu_temp(self):
+        """Highest host CPU temperature visible, in Celsius."""
+        vals = [t for t in (read_temp(p) for p in self.cpu_paths) if t is not None]
+        vals += [t for t in (read_temp(p) for p in self.ec_paths) if t is not None]
+        return max(vals) if vals else None
+
+    def fan_rpm(self):
+        if not self.fan_path:
+            return None
+        try:
+            with open(self.fan_path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+
+# --------------------------------------------------------------------------
+# Config and curve
+# --------------------------------------------------------------------------
+
+DEFAULT_CURVE = [(45, 20), (50, 25), (55, 30), (60, 35), (65, 45),
+                 (70, 55), (75, 70), (80, 85), (85, 100), (90, 100)]
+
+
+def load_config(path):
+    cfg = {"poll_seconds": 2.0, "hysteresis": 3.0, "min_duty": 20,
+           "curve": list(DEFAULT_CURVE)}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                key, val = (k.strip() for k in line.split("=", 1))
+                if key == "curve":
+                    pts = []
+                    for item in val.strip().strip('"').split(","):
+                        item = item.strip()
+                        if item:
+                            t, d = item.split(":")
+                            pts.append((float(t), int(d)))
+                    if pts:
+                        cfg["curve"] = sorted(pts)
+                elif key == "poll_seconds":
+                    cfg[key] = float(val)
+                elif key == "hysteresis":
+                    cfg[key] = float(val)
+                elif key == "min_duty":
+                    cfg[key] = int(val)
+    except OSError:
+        pass
+    return cfg
+
+
+def duty_for(curve, temp, hysteresis, rising, floor):
+    """Interpolate the curve. When the temperature is falling, evaluate at
+    temp+hysteresis so the fan only winds down once it has clearly dropped."""
+    eff = temp if rising else temp + hysteresis
+    if eff <= curve[0][0]:
+        duty = curve[0][1]
+    elif eff >= curve[-1][0]:
+        duty = curve[-1][1]
+    else:
+        duty = curve[-1][1]
+        for (t0, d0), (t1, d1) in zip(curve, curve[1:]):
+            if t0 <= eff <= t1:
+                duty = d0 + (d1 - d0) * (eff - t0) / (t1 - t0)
+                break
+    return max(floor, min(100, int(round(duty))))
+
+
+def status(cfg, rd):
+    t = rd.cpu_temp()
+    print(f"cpu_temp  : {t if t is not None else 'n/a'} C")
+    print(f"fan_rpm   : {rd.fan_rpm()}")
+    print(f"ec_target : {get_target_rpm()}")
+    print(f"fan source: {rd.fan_path}")
+    print(f"temp srcs : {', '.join(rd.cpu_paths + rd.ec_paths) or 'none'}")
+    print(f"curve     : {cfg['curve']}")
+    print(f"poll={cfg['poll_seconds']}s hysteresis={cfg['hysteresis']} "
+          f"min_duty={cfg['min_duty']}%")
+
+
+def main():
+    args = sys.argv[1:]
+    cfg_path = DEFAULT_CONFIG
+    if "--config" in args:
+        cfg_path = args[args.index("--config") + 1]
+    cfg = load_config(cfg_path)
+    rd = Readings()
+
+    if "--status" in args:
+        status(cfg, rd)
+        return 0
+    if "--auto" in args:
+        r = set_auto()
+        print(f"fan control handed back to EC: result={r}")
+        return 0
+    if "--once" in args:
+        t = rd.cpu_temp()
+        if t is None:
+            log("no temperature readable; forcing 100%")
+            set_duty(100)
+            return 1
+        duty = duty_for(cfg["curve"], t, 0.0, True, cfg["min_duty"])
+        set_duty(duty)
+        log(f"temp={t:.1f}C -> duty={duty}% (rpm={rd.fan_rpm()})")
+        return 0
+
+    def stop(signum, frame):
+        log(f"signal {signum}: handing fan control back to the EC")
+        set_auto()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    log(f"starting (config={cfg_path}, poll={cfg['poll_seconds']}s)")
+    log(f"fan source {rd.fan_path}, temps {rd.cpu_paths + rd.ec_paths}")
+    last_duty = None
+    prev_temp = None
+    while True:
+        t = rd.cpu_temp()
+        if t is None:
+            log("temperature unavailable -> 100% duty")
+            set_duty(100)
+            last_duty = 100
+        else:
+            rising = prev_temp is None or t >= prev_temp
+            duty = duty_for(cfg["curve"], t, cfg["hysteresis"], rising, cfg["min_duty"])
+            if last_duty is not None and abs(duty - last_duty) <= DUTY_DEADBAND:
+                duty = last_duty
+            r = set_duty(duty)
+            if r == EC_RES_SUCCESS:
+                if duty != last_duty:
+                    log(f"temp={t:.1f}C -> duty={duty}% (rpm={rd.fan_rpm()})")
+                    last_duty = duty
+            else:
+                log(f"temp={t:.1f}C -> duty={duty}% FAILED (EC result {r})")
+            prev_temp = t
+        time.sleep(cfg["poll_seconds"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Run self-tests
+        run: python3 test_ecfan.py
+
+      - name: Syntax-check the daemon
+        run: python3 -m py_compile ecfan
+
+      - name: Syntax-check the installer
+        run: bash -n install.sh
