@@ -31,7 +31,7 @@ The fan goes quiet at idle but still has full headroom under load.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/ecfan.git
+git clone https://github.com/Paulaustin3977/ecfan.git
 cd ecfan
 sudo ./install.sh
 ```
